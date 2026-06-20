@@ -17,7 +17,7 @@ from .manager import (
     import_metadata_from_csv as _import_metadata_from_csv,
 )
 from .exporter import export_bibtex, export_csv, export_reading_list
-from .checker import check_duplicates, check_missing_metadata, check_invalid_files
+from .checker import check_duplicates, check_missing_metadata, check_invalid_files, check_path_consistency, plan_path_fixes, apply_path_fixes
 from .operations import RollbackManager
 from .utils import format_file_size
 
@@ -440,7 +440,7 @@ def import_cmd(ctx, csv_path, dry_run, yes):
         click.echo("(预演模式，不会更新数据库)")
     click.echo()
 
-    updated, not_found, errors = _import_metadata_from_csv(
+    updated, not_found, errors, ambiguous = _import_metadata_from_csv(
         db, csv_path, dry_run=True
     )
 
@@ -450,6 +450,17 @@ def import_cmd(ctx, csv_path, dry_run, yes):
             click.echo(f"  ✗ {err}")
         if len(errors) > 10:
             click.echo(f"  ... 还有 {len(errors) - 10} 个")
+        click.echo()
+
+    if ambiguous:
+        click.echo(f"歧义匹配（一行匹配多篇，已跳过） ({len(ambiguous)}):")
+        for row_num, row_info, matches in ambiguous[:10]:
+            click.echo(f"  ? 第{row_num}行 {row_info}")
+            for mp in matches:
+                t = mp.title or "未知标题"
+                click.echo(f"      - {mp.file_path}  [{t}]")
+        if len(ambiguous) > 10:
+            click.echo(f"  ... 还有 {len(ambiguous) - 10} 行")
         click.echo()
 
     if not_found:
@@ -466,7 +477,9 @@ def import_cmd(ctx, csv_path, dry_run, yes):
 
     click.echo(f"将更新 {len(updated)} 篇论文:")
     for i, (paper, new_meta, old_meta) in enumerate(updated[:15], 1):
-        click.echo(f"  {i}. {os.path.basename(paper.file_path)}")
+        reason = new_meta.pop("_match_reason", "")
+        match_tag = f" [{reason}]" if reason else ""
+        click.echo(f"  {i}. {os.path.basename(paper.file_path)}{match_tag}")
         for k, v in new_meta.items():
             old_val = old_meta.get(k, "")
             if isinstance(old_val, list):
@@ -484,19 +497,23 @@ def import_cmd(ctx, csv_path, dry_run, yes):
             return
 
     if not dry_run:
-        updated_real, not_found_real, errors_real = _import_metadata_from_csv(
+        updated_real, not_found_real, errors_real, ambiguous_real = _import_metadata_from_csv(
             db, csv_path, dry_run=False
         )
 
         rb = get_rollback(ctx)
         rb.start_batch(f"从 CSV 导入 {len(updated_real)} 篇元数据")
         for paper, new_meta, old_meta in updated_real:
+            nm = {k: v for k, v in new_meta.items() if k != "_match_reason"}
             rb.record_metadata_update(paper.file_path, old_meta, paper.to_dict())
         rb.end_batch()
 
         save_db(ctx, db)
         click.echo(f"已更新 {len(updated_real)} 篇论文，操作已记录（可使用 rollback 回滚）")
 
+        if ambiguous_real:
+            click.echo()
+            click.echo(f"跳过歧义匹配 {len(ambiguous_real)} 行，请手动处理后再导入")
         if errors_real:
             click.echo()
             click.echo(f"更新时出错 ({len(errors_real)}):")
@@ -573,9 +590,12 @@ def export(ctx, output, fmt, topic, tag_list, status, year_from, year_to, group_
 @click.option("--folder", type=click.Path(exists=True, file_okay=False), help="指定文件夹检查")
 @click.option("--check-type", type=click.Choice(["all", "duplicates", "missing", "invalid", "paths"]), default="all", help="检查类型")
 @click.option("--recursive/--no-recursive", default=True, help="是否递归检查")
+@click.option("--fix", "fix_paths", is_flag=True, help="修复路径一致性（需配合 --folder 使用）")
+@click.option("--dry-run", is_flag=True, help="修复预演，不实际修改")
+@click.option("--yes", "-y", is_flag=True, help="跳过确认直接修复")
 @click.pass_context
-def check(ctx, folder, check_type, recursive):
-    """检查重复文献、缺失元数据、损坏文件和路径一致性"""
+def check(ctx, folder, check_type, recursive, fix_paths, dry_run, yes):
+    """检查重复文献、缺失元数据、损坏文件和路径一致性，支持一键修复路径"""
     db = load_db(ctx)
 
     if not db.all_papers():
@@ -632,9 +652,10 @@ def check(ctx, folder, check_type, recursive):
             click.echo("所有文件都可以正常打开 ✓")
         click.echo()
 
-    if check_type in ("all", "paths") and folder:
+    missing_files = []
+    unindexed_files = []
+    if (check_type in ("all", "paths") or fix_paths) and folder:
         click.echo("=== 路径一致性检查 ===")
-        from .checker import check_path_consistency
         missing_files, unindexed_files = check_path_consistency(db, folder, recursive)
 
         if missing_files:
@@ -643,8 +664,6 @@ def check(ctx, folder, check_type, recursive):
                 click.echo(f"  ✗ {p}")
             if len(missing_files) > 10:
                 click.echo(f"  ... 还有 {len(missing_files) - 10} 个")
-            click.echo("  修复建议: 确认文件是否被移动/删除，可用 rename 或 organize 更新路径")
-            click.echo("               或手动删除这些记录（重新 scan 会自动跳过已存在的）")
             click.echo()
 
         if unindexed_files:
@@ -653,26 +672,106 @@ def check(ctx, folder, check_type, recursive):
                 click.echo(f"  ? {p}")
             if len(unindexed_files) > 10:
                 click.echo(f"  ... 还有 {len(unindexed_files) - 10} 个")
-            click.echo(f"  修复建议: 执行 `papertool scan --recursive {folder}` 将这些文件加入数据库")
             click.echo()
 
         if not missing_files and not unindexed_files:
             click.echo("数据库与文件系统路径完全一致 ✓")
             click.echo()
 
+    if fix_paths and folder:
+        if not missing_files and not unindexed_files:
+            click.echo("没有需要修复的路径问题 ✓")
+        else:
+            plan = plan_path_fixes(db, folder, missing_files, unindexed_files)
+
+            click.echo("=== 路径修复方案 ===")
+            if dry_run:
+                click.echo("(预演模式，不会实际修改)")
+            click.echo()
+
+            if plan["redirects"]:
+                click.echo(f"重定向到现有 PDF ({len(plan['redirects'])}):")
+                for old, new, reason in plan["redirects"][:10]:
+                    click.echo(f"  ↔ {os.path.basename(old)} → {os.path.basename(new)}  ({reason})")
+                if len(plan["redirects"]) > 10:
+                    click.echo(f"  ... 还有 {len(plan['redirects']) - 10} 个")
+                click.echo()
+
+            if plan["remove_records"]:
+                click.echo(f"从数据库移除失效记录 ({len(plan['remove_records'])}):")
+                for path, title in plan["remove_records"][:10]:
+                    click.echo(f"  ✗ {os.path.basename(path)}  [{title}]")
+                if len(plan["remove_records"]) > 10:
+                    click.echo(f"  ... 还有 {len(plan['remove_records']) - 10} 个")
+                click.echo()
+
+            if plan["scan_files"]:
+                click.echo(f"扫描未入库 PDF ({len(plan['scan_files'])}):")
+                for p in plan["scan_files"][:10]:
+                    click.echo(f"  + {os.path.basename(p)}")
+                if len(plan["scan_files"]) > 10:
+                    click.echo(f"  ... 还有 {len(plan['scan_files']) - 10} 个")
+                click.echo()
+
+            if plan["ambiguous"]:
+                click.echo(f"无法确定重定向目标（歧义） ({len(plan['ambiguous'])}):")
+                for miss, cands in plan["ambiguous"][:5]:
+                    click.echo(f"  ? {os.path.basename(miss)}")
+                    for c in cands:
+                        click.echo(f"      → {os.path.basename(c)}")
+                if len(plan["ambiguous"]) > 5:
+                    click.echo(f"  ... 还有 {len(plan['ambiguous']) - 5} 个")
+                click.echo()
+
+            total_fix = (len(plan["redirects"]) + len(plan["remove_records"])
+                         + len(plan["scan_files"]))
+
+            if dry_run:
+                click.echo(f"(预演模式，共 {total_fix} 项待处理)")
+                return
+
+            if not yes and not click.confirm(f"确认修复以上 {total_fix} 项路径问题?", default=False):
+                click.echo("已取消")
+                return
+
+            result = apply_path_fixes(db, plan, folder)
+
+            rb = get_rollback(ctx)
+            rb.start_batch(f"修复路径一致性: {len(result['removed'])}移除+{len(result['redirected'])}重定向+{len(result['scanned'])}扫描")
+            for op_type, details in result["operations_log"]:
+                if op_type == "remove_record":
+                    rb.record_remove_record(details["file_path"], details["old_metadata"])
+                elif op_type == "redirect_path":
+                    rb.record_redirect_path(
+                        details["old_path"], details["new_path"],
+                        details["old_metadata"], details.get("reason")
+                    )
+                elif op_type == "scan_record":
+                    rb.record_scan_record(details["file_path"])
+            rb.end_batch()
+
+            save_db(ctx, db)
+            click.echo(f"修复完成: 移除 {len(result['removed'])} / 重定向 {len(result['redirected'])} / 扫描 {len(result['scanned'])}")
+            click.echo("操作已记录（可使用 rollback 回滚）")
+            if result["errors"]:
+                click.echo()
+                click.echo(f"错误 ({len(result['errors'])}):")
+                for e in result["errors"]:
+                    click.echo(f"  ✗ {e}")
+        return
+
     if not folder and check_type in ("all", "invalid", "paths"):
         click.echo("提示: 使用 --folder 参数可以检查损坏文件和路径一致性")
         click.echo()
+        click.echo("提示: 使用 --folder --fix 可以自动修复路径一致性")
+        click.echo()
 
-    if folder:
-        from .checker import check_path_consistency
+    if folder and not fix_paths:
         missing_files, unindexed_files = check_path_consistency(db, folder, recursive)
         if missing_files or unindexed_files:
             click.echo("--- 一键修复建议 ---")
-            if unindexed_files:
-                click.echo(f"  papertool scan --recursive {folder}")
-            if missing_files:
-                click.echo(f"  # 检查文件是否被移动，或执行 organize 更新路径")
+            click.echo(f"  papertool check --folder {folder} --fix --dry-run  # 预演修复")
+            click.echo(f"  papertool check --folder {folder} --fix -y         # 实际修复")
             click.echo()
 
 
@@ -706,24 +805,40 @@ def rollback(ctx, steps, batch_id, list_ops, rollback_all, yes):
             ops = batch["operations"]
             count = len(ops)
 
-            op_types = {}
+            summary = RollbackManager.summarize_batch(ops)
+
+            click.echo(f"  {i}. [{ts}] batch={bid}")
+            if desc:
+                click.echo(f"     描述: {desc}")
+            click.echo(f"     摘要: {summary}")
+            click.echo(f"     操作数: {count}")
+
+            shown = 0
             for op in ops:
-                op_types[op.op_type] = op_types.get(op.op_type, 0) + 1
-            type_desc = ", ".join(f"{t}×{c}" for t, c in op_types.items())
-
-            click.echo(f"  {i}. [{ts}] batch={bid}  {desc}")
-            click.echo(f"     共 {count} 个操作: {type_desc}")
-
-            for j, op in enumerate(ops[:5]):
-                d = op.details
-                if op.op_type == "rename":
-                    click.echo(f"       · rename: {os.path.basename(d['old_path'])} → {os.path.basename(d['new_path'])}")
-                elif op.op_type == "move":
-                    click.echo(f"       · move: {os.path.basename(d['source'])} → {os.path.basename(d['destination'])}")
-                elif op.op_type == "metadata_update":
-                    click.echo(f"       · meta: {os.path.basename(d['file_path'])}")
-            if len(ops) > 5:
-                click.echo(f"       · ... 还有 {len(ops) - 5} 个")
+                if shown >= 5:
+                    break
+                if op.summary:
+                    click.echo(f"       · {op.summary}")
+                else:
+                    d = op.details
+                    if op.op_type == "rename":
+                        click.echo(f"       · rename: {os.path.basename(d.get('old_path',''))} → {os.path.basename(d.get('new_path',''))}")
+                    elif op.op_type == "move":
+                        click.echo(f"       · move: {os.path.basename(d.get('source',''))} → {os.path.basename(d.get('destination',''))}")
+                    elif op.op_type == "metadata_update":
+                        click.echo(f"       · meta: {os.path.basename(d.get('file_path',''))}")
+                    elif op.op_type == "remove_record":
+                        click.echo(f"       · remove: {os.path.basename(d.get('file_path',''))}")
+                    elif op.op_type == "redirect_path":
+                        click.echo(f"       · redirect: {os.path.basename(d.get('old_path',''))} → {os.path.basename(d.get('new_path',''))}")
+                    elif op.op_type == "scan_record":
+                        click.echo(f"       · scan: {os.path.basename(d.get('file_path',''))}")
+                    else:
+                        click.echo(f"       · {op.op_type}")
+                shown += 1
+            if len(ops) > shown:
+                click.echo(f"       · ... 还有 {len(ops) - shown} 个")
+            click.echo()
         return
 
     db = load_db(ctx)
@@ -779,12 +894,14 @@ def rollback(ctx, steps, batch_id, list_ops, rollback_all, yes):
         bid = batch_ops[0].batch_id
         desc = batch_ops[0].description or ""
         count = len(batch_ops)
+        batch_summary = RollbackManager.summarize_batch(batch_ops)
         if not yes and not click.confirm(f"确认回滚最近 1 批操作 ({desc or bid or '单条'}, 共 {count} 个操作)?", default=False):
             click.echo("已取消")
             return
         click.echo(f"准备回滚最近 1 批操作...")
         if desc:
             click.echo(f"批次描述: {desc}")
+        click.echo(f"操作摘要: {batch_summary}")
         click.echo(f"操作数量: {count}")
         click.echo()
         ops_to_rollback = list(reversed(batch_ops))
@@ -870,6 +987,60 @@ def rollback(ctx, steps, batch_id, list_ops, rollback_all, yes):
                 else:
                     failed.append(f"文件不存在，无法回滚元数据: {file_path}")
 
+            elif op.op_type == "remove_record":
+                file_path = op.details["file_path"]
+                old_meta = op.details.get("old_metadata", {})
+                if db.get_paper(file_path):
+                    success.append(f"记录已存在: {os.path.basename(file_path)}")
+                elif os.path.exists(file_path):
+                    new_paper = PaperMetadata(file_path=file_path)
+                    for field in ("title", "doi", "journal", "topic", "read_status", "notes", "year",
+                                  "file_hash", "file_size", "added_at"):
+                        if field in old_meta:
+                            setattr(new_paper, field, old_meta[field])
+                    for field in ("authors", "keywords", "tags"):
+                        if field in old_meta and isinstance(old_meta[field], list):
+                            setattr(new_paper, field, list(old_meta[field]))
+                    from .utils import now_str
+                    new_paper.modified_at = now_str()
+                    db.add_paper(new_paper)
+                    success.append(f"恢复已移除记录: {os.path.basename(file_path)}")
+                else:
+                    failed.append(f"文件和记录都不存在，无法恢复: {file_path}")
+
+            elif op.op_type == "redirect_path":
+                old_path = op.details["old_path"]
+                new_path = op.details["new_path"]
+                old_meta = op.details.get("old_metadata", {})
+                paper = db.get_paper(new_path)
+                current_path = paper.file_path if paper else None
+                if current_path == new_path:
+                    if not db.get_paper(old_path):
+                        db.remove_paper(new_path)
+                        paper.file_path = old_path
+                        from .utils import now_str
+                        paper.modified_at = now_str()
+                        db.add_paper(paper)
+                        success.append(f"撤销重定向: {os.path.basename(new_path)} → {os.path.basename(old_path)}")
+                    else:
+                        success.append(f"旧路径已存在记录，保持原状: {os.path.basename(old_path)}")
+                elif current_path == old_path:
+                    success.append(f"已在原位置: {os.path.basename(old_path)}")
+                else:
+                    failed.append(f"撤销重定向失败，当前路径不匹配: current={current_path}")
+
+            elif op.op_type == "scan_record":
+                file_path = op.details["file_path"]
+                paper = db.get_paper(file_path)
+                if paper:
+                    db.remove_paper(file_path)
+                    success.append(f"移除扫描入库记录: {os.path.basename(file_path)} (注意: PDF 文件仍保留)")
+                else:
+                    success.append(f"记录已不存在: {os.path.basename(file_path)}")
+
+            else:
+                failed.append(f"未知操作类型，无法回滚: {op.op_type}")
+
         except Exception as e:
             failed.append(f"回滚失败 ({op.op_type}): {str(e)}")
 
@@ -901,6 +1072,7 @@ def rollback(ctx, steps, batch_id, list_ops, rollback_all, yes):
         click.echo()
 
     click.echo("回滚完成，数据库已同步更新")
+    click.echo("提示: 可用 list、export、check 命令验证结果一致性")
 
 
 @cli.command("list")

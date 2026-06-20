@@ -5,11 +5,22 @@ from typing import List
 from .models import PaperMetadata
 
 
+def _sort_key(paper: PaperMetadata):
+    """稳定排序键：课题→年份→标题→路径，保证 CSV 和 Markdown 顺序一致。"""
+    return (
+        paper.topic or "ZZZZ",
+        -(paper.year or 0),
+        (paper.title or "").lower(),
+        paper.file_path or "",
+    )
+
+
 def export_bibtex(papers: List[PaperMetadata], output_path: str) -> int:
     count = 0
+    sorted_papers = sorted(papers, key=_sort_key)
     with open(output_path, "w", encoding="utf-8") as f:
-        for paper in papers:
-            entry = _paper_to_bibtex(paper, count)
+        for index, paper in enumerate(sorted_papers):
+            entry = _paper_to_bibtex(paper, index)
             if entry:
                 f.write(entry + "\n\n")
                 count += 1
@@ -69,10 +80,11 @@ def export_csv(papers: List[PaperMetadata], output_path: str) -> int:
         "file_size",
     ]
 
+    sorted_papers = sorted(papers, key=_sort_key)
     with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for paper in papers:
+        for paper in sorted_papers:
             row = {
                 "title": paper.title or "",
                 "authors": "; ".join(paper.authors) if paper.authors else "",
@@ -88,75 +100,99 @@ def export_csv(papers: List[PaperMetadata], output_path: str) -> int:
             }
             writer.writerow(row)
 
-    return len(papers)
+    return len(sorted_papers)
 
 
 def export_reading_list(papers: List[PaperMetadata], output_path: str,
                         group_by: List[str] = None) -> int:
     """
-    导出阅读书单，支持多字段分组。
+    导出阅读书单，支持多层级树状分组。
+
+    同一个上层分组只出现一次，下层按嵌套结构继续分组。
+    分组和论文顺序都稳定排序。
 
     Args:
         papers: 论文列表
         output_path: 输出文件路径
-        group_by: 分组字段列表，如 ["topic", "year"]，按顺序嵌套分组
+        group_by: 分组字段列表，如 ["topic", "year", "read_status"]
                   支持: topic, read_status, year
     """
     if group_by is None:
         group_by = ["topic"]
 
-    def get_group_key(paper: PaperMetadata, fields: List[str]) -> tuple:
-        key_parts = []
-        for field in fields:
-            if field == "topic":
-                key_parts.append(paper.topic or "未分类")
-            elif field == "read_status":
-                key_parts.append(paper.read_status or "unknown")
-            elif field == "year":
-                key_parts.append(str(paper.year) if paper.year else "未知年份")
-            else:
-                key_parts.append("全部文献")
-        return tuple(key_parts)
+    def _field_sort_val(field: str, paper: PaperMetadata):
+        if field == "topic":
+            return paper.topic or "未分类"
+        elif field == "read_status":
+            return paper.read_status or "unknown"
+        elif field == "year":
+            return str(paper.year) if paper.year else "未知年份"
+        return "全部"
 
-    grouped = {}
-    for paper in papers:
-        key = get_group_key(paper, group_by)
-        grouped.setdefault(key, []).append(paper)
+    sorted_papers = sorted(papers, key=_sort_key)
+
+    class Node:
+        __slots__ = ("key", "level", "papers", "children")
+        def __init__(self, key, level):
+            self.key = key
+            self.level = level
+            self.papers = []
+            self.children = {}
+
+    root = Node(None, -1)
+
+    for paper in sorted_papers:
+        node = root
+        for depth, field in enumerate(group_by):
+            k = _field_sort_val(field, paper)
+            if k not in node.children:
+                node.children[k] = Node(k, depth)
+            node = node.children[k]
+        node.papers.append(paper)
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("# 阅读书单\n\n")
         total = 0
 
-        for group_key in sorted(grouped.keys()):
-            group_papers = grouped[group_key]
+        def _count_all(node: Node) -> int:
+            c = len(node.papers)
+            for ch in node.children.values():
+                c += _count_all(ch)
+            return c
 
-            level = 1
-            for part in group_key:
-                f.write(f"{'#' * (level + 1)} {part}")
-                if level == len(group_key):
-                    f.write(f" ({len(group_papers)}篇)")
-                f.write("\n\n")
-                level += 1
+        def write_node(node: Node):
+            nonlocal total
 
-            for i, paper in enumerate(group_papers, 1):
-                total += 1
-                title = paper.title or "未知标题"
-                authors = ", ".join(paper.authors) if paper.authors else "未知作者"
-                year = paper.year or "----"
-                status = paper.read_status or "unread"
+            if node.level >= 0:
+                count = _count_all(node)
+                f.write(f"{'#' * (node.level + 2)} {node.key} ({count}篇)\n\n")
 
-                f.write(f"{i}. **{title}**\n")
-                f.write(f"   - 作者: {authors}\n")
-                f.write(f"   - 年份: {year}\n")
-                if paper.journal:
-                    f.write(f"   - 期刊: {paper.journal}\n")
-                if paper.doi:
-                    f.write(f"   - DOI: {paper.doi}\n")
-                if paper.tags:
-                    f.write(f"   - 标签: {', '.join(paper.tags)}\n")
-                if paper.topic:
-                    f.write(f"   - 课题: {paper.topic}\n")
-                f.write(f"   - 状态: {status}\n")
-                f.write(f"   - 文件: `{paper.file_path}`\n\n")
+            if node.papers:
+                for i, paper in enumerate(node.papers, 1):
+                    total += 1
+                    title = paper.title or "未知标题"
+                    authors = ", ".join(paper.authors) if paper.authors else "未知作者"
+                    year = paper.year or "----"
+                    status = paper.read_status or "unread"
+
+                    f.write(f"{i}. **{title}**\n")
+                    f.write(f"   - 作者: {authors}\n")
+                    f.write(f"   - 年份: {year}\n")
+                    if paper.journal:
+                        f.write(f"   - 期刊: {paper.journal}\n")
+                    if paper.doi:
+                        f.write(f"   - DOI: {paper.doi}\n")
+                    if paper.tags:
+                        f.write(f"   - 标签: {', '.join(paper.tags)}\n")
+                    if "topic" not in group_by:
+                        f.write(f"   - 课题: {paper.topic or '未分类'}\n")
+                    if "read_status" not in group_by:
+                        f.write(f"   - 状态: {status}\n")
+                    f.write(f"   - 文件: `{paper.file_path}`\n\n")
+
+            for child_key in sorted(node.children.keys()):
+                write_node(node.children[child_key])
+
+        write_node(root)
 
     return total

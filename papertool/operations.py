@@ -8,12 +8,14 @@ from typing import List, Dict, Optional
 
 class Operation:
     def __init__(self, op_type: str, details: dict, timestamp: str = None,
-                 batch_id: str = None, description: str = None):
+                 batch_id: str = None, description: str = None,
+                 summary: str = None):
         self.op_type = op_type
         self.details = details
         self.timestamp = timestamp or datetime.now().isoformat(timespec="seconds")
         self.batch_id = batch_id
         self.description = description
+        self.summary = summary
 
     def to_dict(self) -> dict:
         return {
@@ -22,6 +24,7 @@ class Operation:
             "timestamp": self.timestamp,
             "batch_id": self.batch_id,
             "description": self.description,
+            "summary": self.summary,
         }
 
     @classmethod
@@ -32,6 +35,7 @@ class Operation:
             timestamp=data.get("timestamp"),
             batch_id=data.get("batch_id"),
             description=data.get("description"),
+            summary=data.get("summary"),
         )
 
 
@@ -65,8 +69,10 @@ class OperationLog:
         return uuid.uuid4().hex[:8]
 
     def add_operation(self, op_type: str, details: dict,
-                      batch_id: str = None, description: str = None) -> None:
-        op = Operation(op_type, details, batch_id=batch_id, description=description)
+                      batch_id: str = None, description: str = None,
+                      summary: str = None) -> None:
+        op = Operation(op_type, details, batch_id=batch_id,
+                       description=description, summary=summary)
         self.operations.append(op)
         self._save()
 
@@ -188,6 +194,20 @@ class RollbackManager:
         )
 
     def record_metadata_update(self, file_path: str, old_meta: dict, new_meta: dict) -> None:
+        changed_fields = []
+        list_fields = {"authors", "keywords", "tags"}
+        for k in set(list(old_meta.keys()) + list(new_meta.keys())):
+            ov = old_meta.get(k)
+            nv = new_meta.get(k)
+            if k in list_fields:
+                ov_list = sorted(ov) if isinstance(ov, list) else []
+                nv_list = sorted(nv) if isinstance(nv, list) else []
+                if ov_list != nv_list:
+                    changed_fields.append(k)
+            else:
+                if ov != nv:
+                    changed_fields.append(k)
+        summary = f"{os.path.basename(file_path)}: {', '.join(changed_fields)}" if changed_fields else os.path.basename(file_path)
         self.log.add_operation(
             "metadata_update",
             {
@@ -197,7 +217,78 @@ class RollbackManager:
             },
             batch_id=self._current_batch_id,
             description=self._current_batch_desc,
+            summary=summary,
         )
+
+    def record_remove_record(self, file_path: str, old_meta: dict) -> None:
+        summary = f"移除记录: {os.path.basename(file_path)}"
+        self.log.add_operation(
+            "remove_record",
+            {"file_path": file_path, "old_metadata": old_meta},
+            batch_id=self._current_batch_id,
+            description=self._current_batch_desc,
+            summary=summary,
+        )
+
+    def record_redirect_path(self, old_path: str, new_path: str, old_meta: dict, reason: str = None) -> None:
+        summary = f"重定向: {os.path.basename(old_path)} → {os.path.basename(new_path)}"
+        self.log.add_operation(
+            "redirect_path",
+            {
+                "old_path": old_path,
+                "new_path": new_path,
+                "old_metadata": old_meta,
+                "reason": reason,
+            },
+            batch_id=self._current_batch_id,
+            description=self._current_batch_desc,
+            summary=summary,
+        )
+
+    def record_scan_record(self, file_path: str) -> None:
+        summary = f"扫描入库: {os.path.basename(file_path)}"
+        self.log.add_operation(
+            "scan_record",
+            {"file_path": file_path},
+            batch_id=self._current_batch_id,
+            description=self._current_batch_desc,
+            summary=summary,
+        )
+
+    @staticmethod
+    def summarize_batch(batch_ops: List[Operation]) -> str:
+        """生成批次摘要，显示操作类型统计和字段变化。"""
+        type_counts = {}
+        for op in batch_ops:
+            type_counts[op.op_type] = type_counts.get(op.op_type, 0) + 1
+
+        type_parts = []
+        for t, c in sorted(type_counts.items()):
+            type_parts.append(f"{t}×{c}")
+
+        if "metadata_update" in type_counts:
+            field_counts = {}
+            for op in batch_ops:
+                if op.op_type != "metadata_update":
+                    continue
+                om = op.details.get("old_metadata", {})
+                nm = op.details.get("new_metadata", {})
+                list_fields = {"authors", "keywords", "tags"}
+                for k in set(list(om.keys()) + list(nm.keys())):
+                    ov, nv = om.get(k), nm.get(k)
+                    if k in list_fields:
+                        ovl = sorted(ov) if isinstance(ov, list) else []
+                        nvl = sorted(nv) if isinstance(nv, list) else []
+                        if ovl != nvl:
+                            field_counts[k] = field_counts.get(k, 0) + 1
+                    else:
+                        if ov != nv:
+                            field_counts[k] = field_counts.get(k, 0) + 1
+            if field_counts:
+                field_parts = ", ".join(f"{k}×{c}" for k, c in sorted(field_counts.items()))
+                type_parts.append(f"[字段: {field_parts}]")
+
+        return "  ".join(type_parts)
 
     def rollback_last(self, count: int = 1) -> Dict[str, list]:
         results = {"success": [], "failed": []}

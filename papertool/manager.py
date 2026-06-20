@@ -310,22 +310,24 @@ def import_metadata_from_csv(
     db: PaperDatabase,
     csv_path: str,
     dry_run: bool = False,
-) -> Tuple[List[Tuple[PaperMetadata, dict]], List[str], List[str]]:
+) -> Tuple[List[Tuple[PaperMetadata, dict]], List[str], List[str], List[tuple]]:
     """
-    从 CSV 批量导入元数据。
+    从 CSV 批量导入元数据，四级兜底匹配：file_path → DOI → 标题 → 文件名。
 
     CSV 列名支持：file_path, title, authors, year, doi, journal, keywords, tags, topic, read_status
     authors / keywords / tags 用分号 "; " 分隔。
 
     Returns:
-        (updated_papers, not_found_paths, errors)
-        updated_papers: [(paper, new_metadata_dict), ...]
+        (updated_papers, not_found_paths, errors, ambiguous_matches)
+        updated_papers: [(paper, new_metadata_dict, old_meta_dict), ...]
+        ambiguous_matches: [(row_num, row_info, matched_papers), ...]  一行匹配多篇的歧义
     """
     import csv
 
     updated = []
     not_found = []
     errors = []
+    ambiguous = []
 
     field_mapping = {
         "file_path": "file_path",
@@ -341,23 +343,99 @@ def import_metadata_from_csv(
         "status": "read_status",
     }
 
+    def _norm(p):
+        return os.path.abspath(os.path.normpath(p))
+
+    papers_by_path = {}
+    papers_by_doi = {}
+    papers_by_title = {}
+    papers_by_fname = {}
+
+    for p in db.all_papers():
+        papers_by_path[_norm(p.file_path)] = p
+        if p.doi:
+            d = p.doi.lower().strip()
+            papers_by_doi.setdefault(d, []).append(p)
+        if p.title:
+            t = p.title.lower().strip()
+            papers_by_title.setdefault(t, []).append(p)
+        fn = os.path.basename(p.file_path).lower()
+        papers_by_fname.setdefault(fn, []).append(p)
+
     try:
         with open(csv_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
 
             for row_num, row in enumerate(reader, 2):
-                if "file_path" not in row or not row["file_path"].strip():
-                    errors.append(f"第 {row_num} 行: 缺少 file_path")
+                matched_paper = None
+                match_reason = ""
+
+                candidates = []
+                row_info = ""
+
+                fp = row.get("file_path", "").strip()
+                doi_v = row.get("doi", "").strip().lower()
+                title_v = row.get("title", "").strip().lower()
+
+                if fp:
+                    fn_v = os.path.basename(fp).lower()
+                else:
+                    fn_v = ""
+
+                row_info_parts = []
+                if fp:
+                    row_info_parts.append(f"file_path={fp}")
+                if doi_v:
+                    row_info_parts.append(f"doi={doi_v}")
+                if title_v:
+                    row_info_parts.append(f"title={title_v}")
+                row_info = ", ".join(row_info_parts) or f"第{row_num}行"
+
+                # Level 1: file_path 精确匹配
+                if fp:
+                    p = papers_by_path.get(_norm(fp))
+                    if p:
+                        candidates = [p]
+                        match_reason = "file_path 精确匹配"
+
+                # Level 2: DOI 匹配
+                if not candidates and doi_v:
+                    lst = papers_by_doi.get(doi_v, [])
+                    if len(lst) == 1:
+                        candidates = lst
+                        match_reason = f"DOI 匹配 ({doi_v})"
+                    elif len(lst) > 1:
+                        ambiguous.append((row_num, row_info, lst))
+                        continue
+
+                # Level 3: 标题匹配
+                if not candidates and title_v:
+                    lst = papers_by_title.get(title_v, [])
+                    if len(lst) == 1:
+                        candidates = lst
+                        match_reason = f"标题匹配 ({title_v})"
+                    elif len(lst) > 1:
+                        ambiguous.append((row_num, row_info, lst))
+                        continue
+
+                # Level 4: 文件名匹配
+                if not candidates and fn_v:
+                    lst = papers_by_fname.get(fn_v, [])
+                    if len(lst) == 1:
+                        candidates = lst
+                        match_reason = f"文件名匹配 ({fn_v})"
+                    elif len(lst) > 1:
+                        ambiguous.append((row_num, row_info, lst))
+                        continue
+
+                if len(candidates) == 1:
+                    matched_paper = candidates[0]
+
+                if matched_paper is None:
+                    not_found.append(row_info)
                     continue
 
-                file_path = _normalize_path(row["file_path"].strip())
-                paper = db.get_paper(file_path)
-
-                if paper is None:
-                    not_found.append(file_path)
-                    continue
-
-                old_meta = paper.to_dict()
+                old_meta = matched_paper.to_dict()
                 new_meta = {}
 
                 for csv_col, field in field_mapping.items():
@@ -385,15 +463,17 @@ def import_metadata_from_csv(
 
                 if not dry_run:
                     for k, v in new_meta.items():
-                        setattr(paper, k, v)
-                    paper.modified_at = now_str()
-                    db.add_paper(paper)
+                        setattr(matched_paper, k, v)
+                    from .utils import now_str
+                    matched_paper.modified_at = now_str()
+                    db.add_paper(matched_paper)
 
-                updated.append((paper, new_meta, old_meta))
+                new_meta["_match_reason"] = match_reason
+                updated.append((matched_paper, new_meta, old_meta))
 
     except FileNotFoundError:
         errors.append(f"文件不存在: {csv_path}")
     except Exception as e:
         errors.append(f"读取 CSV 失败: {str(e)}")
 
-    return updated, not_found, errors
+    return updated, not_found, errors, ambiguous
