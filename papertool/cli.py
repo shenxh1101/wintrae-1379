@@ -425,23 +425,38 @@ def organize(ctx, base_dir, layers, dry_run, yes):
 @click.argument("csv_path", type=click.Path(exists=True, dir_okay=False))
 @click.option("--dry-run", is_flag=True, help="预演模式，不实际更新数据库")
 @click.option("--yes", "-y", is_flag=True, help="跳过确认直接执行")
+@click.option("--base-dir", type=click.Path(exists=True, file_okay=False),
+              help="相对路径解析的基准目录（默认：CSV 所在目录）")
+@click.option("--confirm-list", type=click.Path(), default=None,
+              help="歧义匹配时导出待确认清单 CSV（编辑 choice_index 列后再导入）")
+@click.option("--no-fuzzy", "no_fuzzy", is_flag=True, help="禁用标题模糊匹配（仅精确匹配）")
 @click.pass_context
-def import_cmd(ctx, csv_path, dry_run, yes):
+def import_cmd(ctx, csv_path, dry_run, yes, base_dir, confirm_list, no_fuzzy):
     """从 CSV 批量导入元数据（DOI、期刊、关键词、标签、课题、阅读状态等）
 
-    CSV 需包含 file_path 列（与数据库中的路径匹配），可选列：
-    title, authors, year, doi, journal, keywords, tags, topic, read_status
-    authors / keywords / tags 用分号 "; " 分隔。
+    匹配策略（按优先级）：
+      1. file_path（支持绝对/相对路径、file:// 前缀）
+      2. DOI（支持 https://doi.org/URL、doi:前缀，大小写不敏感）
+      3. 标题精确匹配（大小写不敏感）
+      4. 文件名精确匹配
+      5. 标题模糊匹配（停用词分词后包含，默认启用）
+
+    一行匹配多篇时，会导出歧义清单到 --confirm-list 指定的 CSV，
+    在 choice_index 列填入要选的 candidate_index，保存后再执行 import。
     """
     db = load_db(ctx)
 
     click.echo(f"CSV 文件: {csv_path}")
     if dry_run:
         click.echo("(预演模式，不会更新数据库)")
+    if base_dir:
+        click.echo(f"相对路径基准目录: {base_dir}")
     click.echo()
 
-    updated, not_found, errors, ambiguous = _import_metadata_from_csv(
-        db, csv_path, dry_run=True
+    fuzzy = not no_fuzzy
+    updated, not_found, errors, ambiguous, confirm_written = _import_metadata_from_csv(
+        db, csv_path, dry_run=True,
+        confirm_list_path=confirm_list, base_dir=base_dir, fuzzy_title=fuzzy
     )
 
     if errors:
@@ -450,6 +465,11 @@ def import_cmd(ctx, csv_path, dry_run, yes):
             click.echo(f"  ✗ {err}")
         if len(errors) > 10:
             click.echo(f"  ... 还有 {len(errors) - 10} 个")
+        click.echo()
+
+    if confirm_written:
+        click.echo(f"歧义待确认清单已导出: {confirm_written}")
+        click.echo("  → 编辑 choice_index 列（填候选的 candidate_index 值）后再导入")
         click.echo()
 
     if ambiguous:
@@ -481,6 +501,8 @@ def import_cmd(ctx, csv_path, dry_run, yes):
         match_tag = f" [{reason}]" if reason else ""
         click.echo(f"  {i}. {os.path.basename(paper.file_path)}{match_tag}")
         for k, v in new_meta.items():
+            if k.startswith("_"):
+                continue
             old_val = old_meta.get(k, "")
             if isinstance(old_val, list):
                 old_val = "; ".join(old_val) if old_val else ""
@@ -497,14 +519,15 @@ def import_cmd(ctx, csv_path, dry_run, yes):
             return
 
     if not dry_run:
-        updated_real, not_found_real, errors_real, ambiguous_real = _import_metadata_from_csv(
-            db, csv_path, dry_run=False
+        updated_real, not_found_real, errors_real, ambiguous_real, confirm_written2 = _import_metadata_from_csv(
+            db, csv_path, dry_run=False,
+            confirm_list_path=None, base_dir=base_dir, fuzzy_title=fuzzy
         )
 
         rb = get_rollback(ctx)
         rb.start_batch(f"从 CSV 导入 {len(updated_real)} 篇元数据")
         for paper, new_meta, old_meta in updated_real:
-            nm = {k: v for k, v in new_meta.items() if k != "_match_reason"}
+            nm = {k: v for k, v in new_meta.items() if not k.startswith("_")}
             rb.record_metadata_update(paper.file_path, old_meta, paper.to_dict())
         rb.end_batch()
 
@@ -513,7 +536,7 @@ def import_cmd(ctx, csv_path, dry_run, yes):
 
         if ambiguous_real:
             click.echo()
-            click.echo(f"跳过歧义匹配 {len(ambiguous_real)} 行，请手动处理后再导入")
+            click.echo(f"跳过歧义匹配 {len(ambiguous_real)} 行，请用 --confirm-list 导出清单后确认")
         if errors_real:
             click.echo()
             click.echo(f"更新时出错 ({len(errors_real)}):")
@@ -534,9 +557,10 @@ def import_cmd(ctx, csv_path, dry_run, yes):
 @click.option("--group-by", "group_by_list", multiple=True,
               type=click.Choice(["topic", "read_status", "year"]),
               help="阅读书单分组字段，可多次指定按顺序嵌套 (例如: --group-by topic --group-by year)")
+@click.option("--summary", is_flag=True, help="包含汇总统计 (按课题/年份/状态 + 待读数量)")
 @click.pass_context
-def export(ctx, output, fmt, topic, tag_list, status, year_from, year_to, group_by_list):
-    """导出文献信息为 BibTeX、CSV 或阅读书单，支持多条件筛选和多字段分组"""
+def export(ctx, output, fmt, topic, tag_list, status, year_from, year_to, group_by_list, summary):
+    """导出文献信息为 BibTeX、CSV 或阅读书单，支持多条件筛选、多字段分组和汇总统计"""
     db = load_db(ctx)
 
     papers = db.all_papers()
@@ -577,11 +601,11 @@ def export(ctx, output, fmt, topic, tag_list, status, year_from, year_to, group_
         count = export_bibtex(papers, output)
         click.echo(f"BibTeX 已导出到: {output}")
     elif fmt == "csv":
-        count = export_csv(papers, output)
-        click.echo(f"CSV 已导出到: {output}")
+        count = export_csv(papers, output, include_summary=summary)
+        click.echo(f"CSV 已导出到: {output}" + (" (含汇总统计)" if summary else ""))
     elif fmt == "reading":
-        count = export_reading_list(papers, output, group_by)
-        click.echo(f"阅读书单已导出到: {output} (按 {'/'.join(group_by)} 分组)")
+        count = export_reading_list(papers, output, group_by, include_summary=summary)
+        click.echo(f"阅读书单已导出到: {output} (按 {'/'.join(group_by)} 分组)" + (" (含汇总统计)" if summary else ""))
 
     click.echo(f"共 {count} 条记录")
 
@@ -593,9 +617,15 @@ def export(ctx, output, fmt, topic, tag_list, status, year_from, year_to, group_
 @click.option("--fix", "fix_paths", is_flag=True, help="修复路径一致性（需配合 --folder 使用）")
 @click.option("--dry-run", is_flag=True, help="修复预演，不实际修改")
 @click.option("--yes", "-y", is_flag=True, help="跳过确认直接修复")
+@click.option("--skip-missing", "skip_missing", multiple=True,
+              help="修复时跳过指定失效路径（可多次指定）")
+@click.option("--skip-unindexed", "skip_unindexed", multiple=True,
+              help="修复时跳过指定未入库文件（可多次指定）")
+@click.option("--recheck/--no-recheck", default=True, help="修复后再次检查显示处理情况")
 @click.pass_context
-def check(ctx, folder, check_type, recursive, fix_paths, dry_run, yes):
-    """检查重复文献、缺失元数据、损坏文件和路径一致性，支持一键修复路径"""
+def check(ctx, folder, check_type, recursive, fix_paths, dry_run, yes,
+          skip_missing, skip_unindexed, recheck):
+    """检查重复文献、缺失元数据、损坏文件和路径一致性，支持一键修复与部分跳过"""
     db = load_db(ctx)
 
     if not db.all_papers():
@@ -679,15 +709,35 @@ def check(ctx, folder, check_type, recursive, fix_paths, dry_run, yes):
             click.echo()
 
     if fix_paths and folder:
+        before_missing = set(os.path.abspath(os.path.normpath(p)) for p in missing_files)
+        before_unindexed = set(os.path.abspath(os.path.normpath(p)) for p in unindexed_files)
+
         if not missing_files and not unindexed_files:
             click.echo("没有需要修复的路径问题 ✓")
         else:
-            plan = plan_path_fixes(db, folder, missing_files, unindexed_files)
+            def _norm(p):
+                return os.path.abspath(os.path.normpath(p))
+
+            skip_missing_set = set(_norm(p) for p in skip_missing)
+            skip_unindexed_set = set(_norm(p) for p in skip_unindexed)
+            user_choices = {
+                "skip_missing": list(skip_missing_set),
+                "skip_unindexed": list(skip_unindexed_set),
+            }
+            plan = plan_path_fixes(db, folder, missing_files, unindexed_files, user_choices)
 
             click.echo("=== 路径修复方案 ===")
             if dry_run:
                 click.echo("(预演模式，不会实际修改)")
             click.echo()
+
+            if plan["skipped_missing"]:
+                click.echo(f"保留不动的失效记录 ({len(plan['skipped_missing'])}):")
+                for path, title in plan["skipped_missing"][:10]:
+                    click.echo(f"  ⏭ 跳过 {os.path.basename(path)}  [{title}]")
+                if len(plan["skipped_missing"]) > 10:
+                    click.echo(f"  ... 还有 {len(plan['skipped_missing']) - 10} 个")
+                click.echo()
 
             if plan["redirects"]:
                 click.echo(f"重定向到现有 PDF ({len(plan['redirects'])}):")
@@ -713,6 +763,14 @@ def check(ctx, folder, check_type, recursive, fix_paths, dry_run, yes):
                     click.echo(f"  ... 还有 {len(plan['scan_files']) - 10} 个")
                 click.echo()
 
+            if plan.get("skipped_unindexed"):
+                click.echo(f"保留不动的未入库文件 ({len(plan['skipped_unindexed'])}):")
+                for p in plan["skipped_unindexed"][:10]:
+                    click.echo(f"  ⏭ 跳过 {os.path.basename(p)}")
+                if len(plan["skipped_unindexed"]) > 10:
+                    click.echo(f"  ... 还有 {len(plan['skipped_unindexed']) - 10} 个")
+                click.echo()
+
             if plan["ambiguous"]:
                 click.echo(f"无法确定重定向目标（歧义） ({len(plan['ambiguous'])}):")
                 for miss, cands in plan["ambiguous"][:5]:
@@ -728,6 +786,7 @@ def check(ctx, folder, check_type, recursive, fix_paths, dry_run, yes):
 
             if dry_run:
                 click.echo(f"(预演模式，共 {total_fix} 项待处理)")
+                click.echo("  提示: 可用 --skip-missing <path> / --skip-unindexed <path> 部分跳过")
                 return
 
             if not yes and not click.confirm(f"确认修复以上 {total_fix} 项路径问题?", default=False):
@@ -758,6 +817,35 @@ def check(ctx, folder, check_type, recursive, fix_paths, dry_run, yes):
                 click.echo(f"错误 ({len(result['errors'])}):")
                 for e in result["errors"]:
                     click.echo(f"  ✗ {e}")
+
+            # 修复后再次校验
+            if recheck:
+                click.echo()
+                click.echo("=== 修复后再次校验 ===")
+                missing_after, unindexed_after = check_path_consistency(db, folder, recursive)
+                after_missing = set(_norm(p) for p in missing_after)
+                after_unindexed = set(_norm(p) for p in unindexed_after)
+
+                handled_missing = before_missing - after_missing
+                remain_missing = before_missing & after_missing
+                handled_unindexed = before_unindexed - after_unindexed
+                remain_unindexed = before_unindexed & after_unindexed
+
+                click.echo(f"失效记录: 已处理 {len(handled_missing)} / 仍保留 {len(remain_missing)}")
+                if remain_missing:
+                    click.echo("  仍保留的:")
+                    for p in list(remain_missing)[:5]:
+                        click.echo(f"    ✗ {os.path.basename(p)}")
+
+                click.echo(f"未入库文件: 已处理 {len(handled_unindexed)} / 仍保留 {len(remain_unindexed)}")
+                if remain_unindexed:
+                    click.echo("  仍保留的:")
+                    for p in list(remain_unindexed)[:5]:
+                        click.echo(f"    ? {os.path.basename(p)}")
+
+                if not remain_missing and not remain_unindexed:
+                    click.echo("✓ 数据库与文件系统现在完全一致")
+                click.echo()
         return
 
     if not folder and check_type in ("all", "invalid", "paths"):
@@ -772,6 +860,7 @@ def check(ctx, folder, check_type, recursive, fix_paths, dry_run, yes):
             click.echo("--- 一键修复建议 ---")
             click.echo(f"  papertool check --folder {folder} --fix --dry-run  # 预演修复")
             click.echo(f"  papertool check --folder {folder} --fix -y         # 实际修复")
+            click.echo(f"  papertool check --folder {folder} --fix -y --skip-missing <path1> --skip-unindexed <path2>  # 部分跳过")
             click.echo()
 
 
@@ -992,7 +1081,8 @@ def rollback(ctx, steps, batch_id, list_ops, rollback_all, yes):
                 old_meta = op.details.get("old_metadata", {})
                 if db.get_paper(file_path):
                     success.append(f"记录已存在: {os.path.basename(file_path)}")
-                elif os.path.exists(file_path):
+                else:
+                    # 即使原 PDF 暂时不在，也要恢复记录（后续可再用 check 重新指向）
                     new_paper = PaperMetadata(file_path=file_path)
                     for field in ("title", "doi", "journal", "topic", "read_status", "notes", "year",
                                   "file_hash", "file_size", "added_at"):
@@ -1004,9 +1094,10 @@ def rollback(ctx, steps, batch_id, list_ops, rollback_all, yes):
                     from .utils import now_str
                     new_paper.modified_at = now_str()
                     db.add_paper(new_paper)
-                    success.append(f"恢复已移除记录: {os.path.basename(file_path)}")
-                else:
-                    failed.append(f"文件和记录都不存在，无法恢复: {file_path}")
+                    if os.path.exists(file_path):
+                        success.append(f"恢复已移除记录: {os.path.basename(file_path)}")
+                    else:
+                        success.append(f"恢复已移除记录 (PDF暂不在，记录已恢复): {os.path.basename(file_path)}")
 
             elif op.op_type == "redirect_path":
                 old_path = op.details["old_path"]
@@ -1044,18 +1135,24 @@ def rollback(ctx, steps, batch_id, list_ops, rollback_all, yes):
         except Exception as e:
             failed.append(f"回滚失败 ({op.op_type}): {str(e)}")
 
-    if is_batch and rollback_bid:
-        rb.log.remove_batch(rollback_bid)
-    elif is_batch and not rollback_bid:
-        n = len(ops_to_rollback)
-        if n <= len(rb.log.operations):
-            rb.log.operations = rb.log.operations[:-n]
-            rb.log._save()
+    all_success = len(failed) == 0
+
+    if all_success:
+        if is_batch and rollback_bid:
+            rb.log.remove_batch(rollback_bid)
+        elif is_batch and not rollback_bid:
+            n = len(ops_to_rollback)
+            if n <= len(rb.log.operations):
+                rb.log.operations = rb.log.operations[:-n]
+                rb.log._save()
+        else:
+            n = len(ops_to_rollback)
+            if n <= len(rb.log.operations):
+                rb.log.operations = rb.log.operations[:-n]
+                rb.log._save()
     else:
-        n = len(ops_to_rollback)
-        if n <= len(rb.log.operations):
-            rb.log.operations = rb.log.operations[:-n]
-            rb.log._save()
+        # 存在失败项，保留操作记录在 rollback --list 中方便继续处理或重试
+        click.echo(f"[INFO] 存在 {len(failed)} 个失败项，操作记录未从 rollback 日志移除，可再次 rollback 继续处理")
 
     save_db(ctx, db)
 
@@ -1066,10 +1163,11 @@ def rollback(ctx, steps, batch_id, list_ops, rollback_all, yes):
         click.echo()
 
     if failed:
-        click.echo("回滚失败:")
+        click.echo("回滚失败 (操作记录仍保留在日志中，可再次 rollback 重试):")
         for msg in failed:
             click.echo(f"  ✗ {msg}")
         click.echo()
+        click.echo("提示: 用 rollback --list 查看仍保留的操作记录")
 
     click.echo("回滚完成，数据库已同步更新")
     click.echo("提示: 可用 list、export、check 命令验证结果一致性")

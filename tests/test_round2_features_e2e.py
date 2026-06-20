@@ -111,7 +111,7 @@ def main():
 
     r = run(["import", csv_title, "--dry-run"])
     assert r.exit_code == 0, f"import 标题 dry-run 失败: {r.output}"
-    assert "标题匹配" in r.output, f"未显示标题匹配原因: {r.output}"
+    assert "标题" in r.output and "匹配" in r.output, f"未显示标题匹配原因: {r.output}"
     _print("  [OK] import 标题匹配预演正确")
 
     r = run(["import", csv_title, "-y"])

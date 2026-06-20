@@ -153,26 +153,59 @@ def run_full_check(db: PaperDatabase, folder: str = None, recursive: bool = True
 def plan_path_fixes(db: PaperDatabase, folder: str,
                     missing_files: List[str],
                     unindexed_files: List[str],
+                    user_choices: Dict = None,
                     ) -> Dict:
     """
     规划路径一致性修复方案（预演用，不实际修改）。
 
+    Args:
+        db: PaperDatabase
+        folder: 基础文件夹
+        missing_files: 数据库有但文件不存在的路径列表
+        unindexed_files: 文件存在但数据库没有的路径列表
+        user_choices: 可选，交互式用户选择 {
+            "remove": [path, ...],            # 选择移除的 missing 路径
+            "redirect": [(old, new), ...],    # 选择重定向的 (old, new)
+            "skip_missing": [path, ...],      # 选择跳过的 missing 路径
+            "scan": [path, ...],              # 选择扫描入库的未入库文件
+        }
+        若 user_choices 为 None 则按原有自动策略：唯一匹配就重定向，否则移除。
+
     Returns:
         dict with keys:
-          - remove_records: [(missing_path, paper_title), ...]  要从数据库移除的记录
-          - redirects: [(missing_path, candidate_unindexed_path, reason), ...]  重定向建议
-          - scan_files: [unindexed_path, ...]  要扫描入库的文件
-          - ambiguous: [(missing_path, [candidate1, candidate2, ...]), ...]  无法确定的歧义
+          - remove_records: [(missing_path, paper_title), ...]
+          - redirects: [(missing_path, candidate_unindexed_path, reason), ...]
+          - scan_files: [unindexed_path, ...]
+          - ambiguous: [(missing_path, [candidate1, candidate2, ...]), ...]
+          - skipped_missing: [(path, title), ...]  保留不动的失效记录
+          - skipped_unindexed: [path, ...]  保留不动的未入库文件
+          - candidates: {missing_path: [(candidate, reason), ...]}  所有候选（用于交互）
     """
     def _norm(p):
         return os.path.abspath(os.path.normpath(p))
 
     folder = _norm(folder)
 
-    remove_records = []
-    redirects = []
-    ambiguous = []
-    scan_files = list(unindexed_files)
+    # 先收集所有候选（供交互使用）
+    all_candidates = {}
+    skip_missing_set = set()
+    skip_unindexed_set = set()
+
+    remove_chosen = set()
+    redirect_chosen = {}  # old_path -> (new_path, reason)
+    scan_chosen = set()
+
+    if user_choices:
+        for p in user_choices.get("skip_missing", []):
+            skip_missing_set.add(_norm(p))
+        for p in user_choices.get("remove", []):
+            remove_chosen.add(_norm(p))
+        for old, new in user_choices.get("redirect", []):
+            redirect_chosen[_norm(old)] = (_norm(new), "user_selected")
+        for p in user_choices.get("scan", []):
+            scan_chosen.add(_norm(p))
+        for p in user_choices.get("skip_unindexed", []):
+            skip_unindexed_set.add(_norm(p))
 
     unindexed_set = set(_norm(p) for p in unindexed_files)
 
@@ -182,7 +215,6 @@ def plan_path_fixes(db: PaperDatabase, folder: str,
         title = paper.title if paper else os.path.basename(miss_norm)
 
         candidates = []
-
         miss_fname = os.path.basename(miss_norm).lower()
         miss_hash = paper.file_hash if paper else None
 
@@ -205,26 +237,78 @@ def plan_path_fixes(db: PaperDatabase, folder: str,
             if reasons:
                 candidates.append((u_norm, "; ".join(reasons)))
 
+        all_candidates[miss_norm] = {
+            "title": title,
+            "candidates": list(candidates),
+        }
+
+    # 应用选择 / 自动策略
+    remove_records = []
+    redirects = []
+    ambiguous = []
+    skipped_missing = []
+    scan_files = []
+
+    used_unindexed = set()
+
+    for miss in missing_files:
+        miss_norm = _norm(miss)
+        info = all_candidates[miss_norm]
+        title = info["title"]
+        candidates = info["candidates"]
+
+        if miss_norm in skip_missing_set:
+            skipped_missing.append((miss_norm, title))
+            continue
+
+        if miss_norm in redirect_chosen:
+            new_path, reason = redirect_chosen[miss_norm]
+            redirects.append((miss_norm, new_path, reason))
+            used_unindexed.add(new_path)
+            continue
+
+        if miss_norm in remove_chosen:
+            remove_records.append((miss_norm, title))
+            continue
+
+        # 自动策略
         if len(candidates) == 1:
             c_path, c_reason = candidates[0]
             redirects.append((miss_norm, c_path, c_reason))
-            if c_path in unindexed_set:
-                unindexed_set.discard(c_path)
-                if c_path in scan_files:
-                    scan_files.remove(c_path)
+            used_unindexed.add(c_path)
         elif len(candidates) > 1:
             ambiguous.append((miss_norm, [c[0] for c in candidates]))
             remove_records.append((miss_norm, title))
         else:
             remove_records.append((miss_norm, title))
 
-    scan_files_final = [p for p in unindexed_files if _norm(p) in unindexed_set]
+    # 处理未入库文件
+    has_scan_whitelist = user_choices is not None and bool(user_choices.get("scan"))
+    for u in unindexed_files:
+        u_norm = _norm(u)
+        if u_norm in skip_unindexed_set:
+            continue
+        if u_norm in used_unindexed:
+            continue
+        if has_scan_whitelist:
+            if u_norm in scan_chosen:
+                scan_files.append(u_norm)
+        else:
+            scan_files.append(u_norm)
+
+    skipped_unindexed = [
+        _norm(u) for u in unindexed_files
+        if _norm(u) not in used_unindexed and _norm(u) not in [_norm(s) for s in scan_files]
+    ]
 
     return {
         "remove_records": remove_records,
         "redirects": redirects,
-        "scan_files": scan_files_final,
+        "scan_files": scan_files,
         "ambiguous": ambiguous,
+        "skipped_missing": skipped_missing,
+        "skipped_unindexed": skipped_unindexed,
+        "candidates": all_candidates,
     }
 
 
@@ -294,10 +378,29 @@ def apply_path_fixes(db: PaperDatabase,
 
     if plan["scan_files"]:
         try:
-            _, new_count = scan_folder(folder, recursive=True,
-                                       extract_meta=extract_meta, db=db)
-            scanned = list(plan["scan_files"])
-            for sp in scanned:
+            scanned = []
+            for sp in plan["scan_files"]:
+                sp = os.path.abspath(os.path.normpath(sp))
+                if db.get_paper(sp):
+                    continue
+                paper = PaperMetadata(file_path=sp)
+                if extract_meta:
+                    try:
+                        from .pdf_parser import extract_pdf_metadata
+                        meta = extract_pdf_metadata(sp)
+                        if meta:
+                            if meta.get("title") and not paper.title:
+                                paper.title = meta["title"]
+                            if meta.get("authors") and not paper.authors:
+                                paper.authors = meta["authors"]
+                            if meta.get("year") and not paper.year:
+                                paper.year = meta["year"]
+                            if meta.get("subject") and not paper.keywords:
+                                paper.keywords = meta["subject"].split(", ")
+                    except Exception:
+                        pass
+                db.add_paper(paper)
+                scanned.append(sp)
                 ops_log.append(("scan_record", {"file_path": sp}))
         except Exception as e:
             errors.append(f"扫描未入库文件失败: {e}")
