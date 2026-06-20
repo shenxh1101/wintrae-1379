@@ -4,19 +4,19 @@ import sys
 import click
 
 from .__init__ import __version__
-from .models import PaperDatabase
+from .models import PaperDatabase, PaperMetadata
 from .manager import (
-    scan_folder,
-    rename_papers,
-    move_by_topic,
-    update_paper_metadata,
-    add_tags,
-    remove_tags,
-    set_read_status,
-    find_papers,
+    scan_folder as _scan_folder,
+    rename_papers as _rename_papers,
+    move_by_topic as _move_by_topic,
+    update_paper_metadata as _update_paper_metadata,
+    add_tags as _add_tags_to_paper,
+    remove_tags as _remove_tags_from_paper,
+    set_read_status as _set_paper_read_status,
+    find_papers as _find_papers,
 )
 from .exporter import export_bibtex, export_csv, export_reading_list
-from .checker import run_full_check, check_duplicates, check_missing_metadata
+from .checker import check_duplicates, check_missing_metadata, check_invalid_files
 from .operations import RollbackManager
 from .utils import format_file_size
 
@@ -40,6 +40,10 @@ def save_db(ctx, db):
 def get_rollback(ctx):
     log_dir = ctx.obj.get("log_dir", DEFAULT_LOG_DIR)
     return RollbackManager(log_dir)
+
+
+def _norm_path(p):
+    return os.path.abspath(os.path.normpath(p))
 
 
 @click.group()
@@ -69,7 +73,7 @@ def scan(ctx, folder, recursive, extract_meta, dry_run):
     db = load_db(ctx)
     initial_count = len(db.all_papers())
 
-    new_db, new_count = scan_folder(
+    new_db, new_count = _scan_folder(
         folder,
         recursive=recursive,
         extract_meta=extract_meta,
@@ -77,7 +81,7 @@ def scan(ctx, folder, recursive, extract_meta, dry_run):
     )
 
     click.echo(f"扫描完成，共发现 {new_count} 篇新论文")
-    click.echo(f"数据库现有 {len(new_db.all_papers())} 篇 (之前有 {initial_count} 篇")
+    click.echo(f"数据库现有 {len(new_db.all_papers())} 篇 (之前有 {initial_count} 篇)")
     click.echo()
 
     papers = new_db.all_papers()[-new_count:] if new_count > 0 else []
@@ -118,8 +122,8 @@ def rename(ctx, folder, all_papers, dry_run, conflict):
 
     target_paths = None
     if folder:
-        target_paths = [
-            p for p in db.papers.keys() if p.startswith(os.path.abspath(folder))]
+        abs_folder = _norm_path(folder)
+        target_paths = [p for p in db.papers.keys() if p.startswith(abs_folder)]
     elif all_papers:
         target_paths = list(db.papers.keys())
     else:
@@ -136,7 +140,7 @@ def rename(ctx, folder, all_papers, dry_run, conflict):
         click.echo("(预演模式)")
     click.echo()
 
-    renamed, conflicts = rename_papers(
+    renamed, conflicts = _rename_papers(
         db,
         paper_paths=target_paths,
         dry_run=dry_run,
@@ -165,35 +169,29 @@ def rename(ctx, folder, all_papers, dry_run, conflict):
         for old, new in renamed:
             rb.record_rename(old, new)
         save_db(ctx, db)
-        click.echo("文件已重命名，操作已记录（可使用 rollback 回滚")
+        click.echo(f"已重命名 {len(renamed)} 个文件，操作已记录（可使用 rollback 回滚）")
     elif dry_run:
         click.echo("(预演模式，未实际修改)")
 
 
 @cli.command()
-@click.argument("file-path", type=click.Path(exists=True))
-@click.option("--add", "add_tags_list", multiple=True, help="添加标签，可多次指定")
-@click.option("--remove", "remove_tags_list", multiple=True, help="移除标签，可多次指定")
+@click.argument("file_path", type=click.Path(exists=True))
+@click.option("--add-tags", "tag_add_list", multiple=True, help="添加标签，可多次指定 (例如: --add-tags nlp --add-tags survey)")
+@click.option("--remove-tags", "tag_remove_list", multiple=True, help="移除标签，可多次指定")
 @click.option("--topic", help="设置课题分组")
 @click.option("--status", type=click.Choice(["unread", "reading", "read", "skimmed"]), help="设置阅读状态")
 @click.option("--doi", help="设置 DOI")
 @click.option("--journal", help="设置期刊名")
 @click.option("--title", help="设置标题")
 @click.option("--year", type=int, help="设置年份")
-@click.option("--author", multiple=True, help="添加作者，可多次指定")
-@click.option("--keyword", multiple=True, help="添加关键词，可多次指定")
+@click.option("--author", "author_list", multiple=True, help="添加作者，可多次指定")
+@click.option("--keyword", "keyword_list", multiple=True, help="添加关键词，可多次指定")
+@click.option("--notes", help="添加备注")
 @click.pass_context
-def tag(ctx, file_path, add_tags_list, remove_tags_list, topic, status, doi, journal, title, year, author, keyword):
+def tag(ctx, file_path, tag_add_list, tag_remove_list, topic, status, doi, journal, title, year, author_list, keyword_list, notes):
     """为论文添加/移除标签，补充元数据和阅读状态"""
     db = load_db(ctx)
-    abs_path = os.path.abspath(os.path.normpath(file_path))
-
-    import sys
-    print("DEBUG add_tags_list:", repr(add_tags_list), file=sys.stderr)
-    print("DEBUG type(add_tags_list):", type(add_tags_list), file=sys.stderr)
-    print("DEBUG add_tags:", add_tags, file=sys.stderr)
-    print("DEBUG add_tags.__module__:", getattr(add_tags, '__module__', '?'), file=sys.stderr)
-    print("DEBUG globals()['add_tags']:", globals().get('add_tags', 'NOT FOUND'), file=sys.stderr)
+    abs_path = _norm_path(file_path)
 
     paper = db.get_paper(abs_path)
     if not paper:
@@ -202,40 +200,47 @@ def tag(ctx, file_path, add_tags_list, remove_tags_list, topic, status, doi, jou
         return
 
     old_meta = paper.to_dict()
+    changed = False
 
-    if add_tags_list:
-        import sys
-        print("DEBUG before add_tags call", file=sys.stderr)
-        add_tags(db, abs_path, list(add_tags_list))
-        print("DEBUG after add_tags call", file=sys.stderr)
-        click.echo(f"添加标签: {', '.join(add_tags_list)}")
+    if tag_add_list:
+        _add_tags_to_paper(db, abs_path, list(tag_add_list))
+        click.echo(f"添加标签: {', '.join(tag_add_list)}")
+        changed = True
 
-    if remove_tags_list:
-        remove_tags(db, abs_path, list(remove_tags_list))
-        click.echo(f"移除标签: {', '.join(remove_tags_list)}")
+    if tag_remove_list:
+        _remove_tags_from_paper(db, abs_path, list(tag_remove_list))
+        click.echo(f"移除标签: {', '.join(tag_remove_list)}")
+        changed = True
 
     updates = {}
-    if topic:
+    if topic is not None:
         updates["topic"] = topic
-    if status:
+    if status is not None:
         updates["read_status"] = status
-    if doi:
+    if doi is not None:
         updates["doi"] = doi
-    if journal:
+    if journal is not None:
         updates["journal"] = journal
-    if title:
+    if title is not None:
         updates["title"] = title
-    if year:
+    if year is not None:
         updates["year"] = year
-    if author:
-        updates["authors"] = list(author)
-    if keyword:
-        updates["keywords"] = list(keyword)
+    if author_list:
+        updates["authors"] = list(author_list)
+    if keyword_list:
+        updates["keywords"] = list(keyword_list)
+    if notes is not None:
+        updates["notes"] = notes
 
     if updates:
-        update_paper_metadata(db, abs_path, **updates)
+        _update_paper_metadata(db, abs_path, **updates)
         for k, v in updates.items():
             click.echo(f"设置 {k}: {v}")
+        changed = True
+
+    if not changed:
+        click.echo("未指定任何修改")
+        return
 
     paper = db.get_paper(abs_path)
     click.echo()
@@ -245,6 +250,112 @@ def tag(ctx, file_path, add_tags_list, remove_tags_list, topic, status, doi, jou
     rb.record_metadata_update(abs_path, old_meta, paper.to_dict())
 
     save_db(ctx, db)
+
+
+@cli.command()
+@click.option("--base-dir", type=click.Path(file_okay=False), help="课题子文件夹的根目录，默认为当前工作目录")
+@click.option("--dry-run", is_flag=True, help="预演模式，只显示将要执行的移动，不实际操作")
+@click.option("--yes", "-y", is_flag=True, help="跳过确认直接执行")
+@click.pass_context
+def organize(ctx, base_dir, dry_run, yes):
+    """按课题分组：将已设置 topic 的论文移动到 课题名/ 子文件夹中"""
+    db = load_db(ctx)
+
+    papers_with_topic = [p for p in db.all_papers() if p.topic]
+
+    if not papers_with_topic:
+        click.echo("没有找到已设置课题的论文，请先用 tag --topic <课题名> 为论文设置课题")
+        return
+
+    if base_dir is None:
+        base_dir = os.getcwd()
+    base_dir = _norm_path(base_dir)
+
+    click.echo(f"根目录: {base_dir}")
+    click.echo(f"待整理论文: {len(papers_with_topic)} 篇")
+    if dry_run:
+        click.echo("(预演模式，不会实际移动文件)")
+    click.echo()
+
+    plan = []
+    for paper in papers_with_topic:
+        safe_topic = "".join(c for c in paper.topic if c not in '<>:"/\\|?*').strip()
+        if not safe_topic:
+            click.echo(f"  ! 跳过课题名非法的论文: {paper.file_path} (topic={paper.topic!r})")
+            continue
+        target_dir = os.path.join(base_dir, safe_topic)
+        target_path = os.path.join(target_dir, os.path.basename(paper.file_path))
+        target_path = _norm_path(target_path)
+        source_path = _norm_path(paper.file_path)
+
+        if source_path == target_path:
+            continue
+
+        if os.path.exists(target_path) and target_path != source_path:
+            click.echo(f"  ! 目标文件已存在，跳过: {target_path}")
+            continue
+
+        plan.append((paper, source_path, target_path))
+
+    if not plan:
+        click.echo("没有需要移动的论文")
+        return
+
+    click.echo("移动计划:")
+    by_topic = {}
+    for paper, src, dst in plan:
+        by_topic.setdefault(paper.topic, []).append((paper, src, dst))
+
+    for topic, items in sorted(by_topic.items()):
+        click.echo(f"  课题 [{topic}] ({len(items)} 篇) -> {os.path.dirname(items[0][2])}")
+        for paper, src, dst in items:
+            click.echo(f"    {os.path.basename(src)}")
+    click.echo()
+
+    if not yes and not dry_run:
+        if not click.confirm(f"确认移动以上 {len(plan)} 个文件?", default=False):
+            click.echo("已取消")
+            return
+
+    rb = get_rollback(ctx)
+    moved_count = 0
+    failed = []
+
+    for paper, src, dst in plan:
+        target_dir = os.path.dirname(dst)
+        try:
+            if not dry_run:
+                os.makedirs(target_dir, exist_ok=True)
+                if os.path.exists(dst):
+                    failed.append((src, "目标已存在"))
+                    continue
+                os.rename(src, dst)
+                db.remove_paper(src)
+                paper.file_path = dst
+                from .utils import now_str
+                paper.modified_at = now_str()
+                db.add_paper(paper)
+                rb.record_move(src, dst)
+            moved_count += 1
+        except OSError as e:
+            failed.append((src, str(e)))
+
+    if not dry_run:
+        save_db(ctx, db)
+
+    click.echo()
+    if dry_run:
+        click.echo(f"预演完成：预计移动 {moved_count} 个文件")
+    else:
+        click.echo(f"已移动 {moved_count} 个文件")
+        if moved_count > 0:
+            click.echo("操作已记录，可使用 rollback 回滚")
+
+    if failed:
+        click.echo()
+        click.echo(f"失败 {len(failed)} 个:")
+        for src, reason in failed:
+            click.echo(f"  ! {src}: {reason}")
 
 
 @cli.command()
@@ -314,8 +425,8 @@ def check(ctx, folder, check_type, recursive):
             for i, group in enumerate(dupes[:5], 1):
                 click.echo(f"  第 {i} 组 ({len(group)} 篇):")
                 for paper in group:
-                    title = paper.title or "未知标题"
-                    click.echo(f"    - {os.path.basename(paper.file_path)}: {title}")
+                    t = paper.title or "未知标题"
+                    click.echo(f"    - {os.path.basename(paper.file_path)}: {t}")
             if len(dupes) > 5:
                 click.echo(f"  ... 还有 {len(dupes) - 5} 组")
         else:
@@ -338,7 +449,6 @@ def check(ctx, folder, check_type, recursive):
 
     if check_type in ("all", "invalid") and folder:
         click.echo("=== 损坏文件检查 ===")
-        from .checker import check_invalid_files
         invalid = check_invalid_files(folder, recursive)
         if invalid:
             click.echo(f"发现 {len(invalid)} 个损坏/不可打开的文件:")
@@ -358,25 +468,32 @@ def check(ctx, folder, check_type, recursive):
 @cli.command()
 @click.option("--steps", type=int, default=1, help="回滚最近几步操作")
 @click.option("--list", "list_ops", is_flag=True, help="列出最近的操作记录")
+@click.option("--all", "rollback_all", is_flag=True, help="回滚所有操作记录")
 @click.pass_context
-def rollback(ctx, steps, list_ops):
+def rollback(ctx, steps, list_ops, rollback_all):
     """回滚最近一次整理操作"""
     rb = get_rollback(ctx)
 
     if list_ops:
-        history = rb.get_history(20)
+        history = rb.get_history(50)
         if not history:
             click.echo("暂无操作记录")
             return
-        click.echo("最近操作记录:")
+        click.echo("最近操作记录 (新→旧):")
         for i, op in enumerate(reversed(history), 1):
             click.echo(f"  {i}. [{op['timestamp']}] {op['op_type']}")
-            details = op.get('details', {})
-            if 'old_path' in details:
-                click.echo(f"     {os.path.basename(details['old_path'])} -> {os.path.basename(details['new_path'])}")
-            elif 'file_path' in details:
+            details = op.get("details", {})
+            if op["op_type"] in ("rename", "move") and "old_path" in details and "new_path" in details:
+                click.echo(f"     {os.path.basename(details['old_path'])}  →  {os.path.basename(details['new_path'])}")
+            elif op["op_type"] == "metadata_update" and "file_path" in details:
                 click.echo(f"     {details['file_path']}")
         return
+
+    if rollback_all:
+        steps = len(rb.log.operations)
+        if steps == 0:
+            click.echo("没有可回滚的操作")
+            return
 
     if steps < 1:
         click.echo("steps 必须大于 0")
@@ -385,48 +502,130 @@ def rollback(ctx, steps, list_ops):
     click.echo(f"准备回滚最近 {steps} 步操作...")
     click.echo()
 
-    results = rb.rollback_last(steps)
+    db = load_db(ctx)
 
-    if results["success"]:
+    recent_ops = list(reversed(rb.log.operations))
+    ops_to_rollback = recent_ops[:steps]
+
+    success = []
+    failed = []
+
+    for op in ops_to_rollback:
+        try:
+            if op.op_type == "rename":
+                old_path = op.details["old_path"]
+                new_path = op.details["new_path"]
+                paper = db.get_paper(new_path)
+                if paper is None:
+                    paper = db.get_paper(old_path)
+                current_path = paper.file_path if paper else None
+
+                if current_path == new_path and os.path.exists(new_path):
+                    os.makedirs(os.path.dirname(old_path), exist_ok=True)
+                    os.rename(new_path, old_path)
+                    if paper:
+                        db.remove_paper(new_path)
+                        paper.file_path = old_path
+                        from .utils import now_str
+                        paper.modified_at = now_str()
+                        db.add_paper(paper)
+                    success.append(f"回滚重命名: {os.path.basename(new_path)} → {os.path.basename(old_path)}")
+                elif current_path == old_path or (paper is None and os.path.exists(old_path)):
+                    success.append(f"已在正确位置: {os.path.basename(old_path)}")
+                else:
+                    failed.append(f"重命名回滚异常 (old={old_path}, new={new_path}, current={current_path})")
+
+            elif op.op_type == "move":
+                src = op.details["source"]
+                dst = op.details["destination"]
+                paper = db.get_paper(dst)
+                if paper is None:
+                    paper = db.get_paper(src)
+                current_path = paper.file_path if paper else None
+
+                if current_path == dst and os.path.exists(dst):
+                    os.makedirs(os.path.dirname(src), exist_ok=True)
+                    os.rename(dst, src)
+                    if paper:
+                        db.remove_paper(dst)
+                        paper.file_path = src
+                        from .utils import now_str
+                        paper.modified_at = now_str()
+                        db.add_paper(paper)
+                    success.append(f"回滚移动: {os.path.basename(dst)} → {os.path.basename(src)}")
+                elif current_path == src or (paper is None and os.path.exists(src)):
+                    success.append(f"已在正确位置: {os.path.basename(src)}")
+                else:
+                    failed.append(f"移动回滚异常 (src={src}, dst={dst}, current={current_path})")
+
+            elif op.op_type == "metadata_update":
+                file_path = op.details["file_path"]
+                old_meta = op.details.get("old_metadata", {})
+                paper = db.get_paper(file_path)
+                if paper:
+                    for field in ("title", "doi", "journal", "topic", "read_status", "notes", "year"):
+                        if field in old_meta:
+                            setattr(paper, field, old_meta[field])
+                    for field in ("authors", "keywords", "tags"):
+                        if field in old_meta and isinstance(old_meta[field], list):
+                            setattr(paper, field, list(old_meta[field]))
+                    from .utils import now_str
+                    paper.modified_at = now_str()
+                    db.add_paper(paper)
+                    success.append(f"回滚元数据: {os.path.basename(file_path)}")
+                elif os.path.exists(file_path):
+                    new_paper = PaperMetadata(file_path=file_path)
+                    for field in ("title", "doi", "journal", "topic", "read_status", "notes", "year"):
+                        if field in old_meta:
+                            setattr(new_paper, field, old_meta[field])
+                    for field in ("authors", "keywords", "tags"):
+                        if field in old_meta and isinstance(old_meta[field], list):
+                            setattr(new_paper, field, list(old_meta[field]))
+                    db.add_paper(new_paper)
+                    success.append(f"回滚元数据 (已重新载入): {os.path.basename(file_path)}")
+                else:
+                    failed.append(f"文件不存在，无法回滚元数据: {file_path}")
+
+        except Exception as e:
+            failed.append(f"回滚失败 ({op.op_type}): {str(e)}")
+
+    n = min(steps, len(rb.log.operations))
+    if n > 0:
+        rb.log.operations = rb.log.operations[:-n]
+        rb.log._save()
+
+    save_db(ctx, db)
+
+    if success:
         click.echo("回滚成功:")
-        for msg in results["success"]:
+        for msg in success:
             click.echo(f"  ✓ {msg}")
         click.echo()
 
-    if results["failed"]:
+    if failed:
         click.echo("回滚失败:")
-        for msg in results["failed"]:
+        for msg in failed:
             click.echo(f"  ✗ {msg}")
         click.echo()
 
-    db = load_db(ctx)
-    papers_to_remove = []
-    for paper in db.all_papers():
-        if not os.path.exists(paper.file_path):
-            papers_to_remove.append(paper.file_path)
-
-    for path in papers_to_remove:
-        db.remove_paper(path)
-
-    if papers_to_remove:
-        save_db(ctx, db)
-        click.echo(f"已从数据库移除 {len(papers_to_remove)} 条不存在的记录")
-
-    click.echo("回滚完成")
+    click.echo("回滚完成，数据库已同步更新")
 
 
-@cli.command()
+@cli.command("list")
 @click.option("--topic", help="按课题筛选")
 @click.option("--tag", help="按标签筛选")
 @click.option("--status", type=click.Choice(["unread", "reading", "read", "skimmed"]), help="按阅读状态筛选")
 @click.option("--author", help="按作者筛选")
 @click.option("--title", help="按标题关键词筛选")
 @click.pass_context
-def list(ctx, topic, tag, status, author, title):
+def list_cmd(ctx, topic, tag, status, author, title):
     """列出数据库中的论文"""
     db = load_db(ctx)
-    papers = find_papers(db, title=title, author=author, tags=[tag] if tag else None,
-                         topic=topic, read_status=status)
+    papers = _find_papers(
+        db, title=title, author=author,
+        tags=[tag] if tag else None,
+        topic=topic, read_status=status,
+    )
 
     if not papers:
         click.echo("没有找到符合条件的论文")
@@ -450,6 +649,8 @@ def _print_paper_info(paper):
     click.echo(f"  标签: {', '.join(paper.tags) if paper.tags else '无'}")
     click.echo(f"  课题: {paper.topic or '未分类'}")
     click.echo(f"  阅读状态: {paper.read_status}")
+    if paper.notes:
+        click.echo(f"  备注: {paper.notes}")
     click.echo(f"  文件大小: {format_file_size(paper.file_size)}")
 
 
@@ -467,6 +668,7 @@ def _print_paper_short(paper, index=None):
         click.echo(f"     作者: {authors}")
     if paper.topic:
         click.echo(f"     课题: {paper.topic}")
+    click.echo(f"     文件: {paper.file_path}")
     click.echo()
 
 
