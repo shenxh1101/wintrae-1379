@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "papers": {
+    "D:\\TraeProjects\\1379\\tests\\test_papers\\2023 - Smith et al - Deep Learning for NLP.pdf": {
+      "file_path": "D:\\TraeProjects\\1379\\tests\\test_papers\\2023 - Smith et al - Deep Learning for NLP.pdf",
+      "title": "Deep Learning for NLP",
+      "authors": [
+        "Smith et al"
+      ],
+      "year": 2023,
+      "doi": null,
+      "journal": null,
+      "keywords": [],
+      "tags": [],
+      "read_status": "reading",
+      "topic": null,
+      "file_size": 329,
+      "file_hash": "8c292227f0f9fdbb5f19034f0f00f94b",
+      "added_at": "2026-06-21T02:03:45",
+      "modified_at": "2026-06-21T02:05:30",
+      "notes": null
+    },
+    "D:\\TraeProjects\\1379\\tests\\test_papers\\old_paper.pdf": {
+      "file_path": "D:\\TraeProjects\\1379\\tests\\test_papers\\old_paper.pdf",
+      "title": "old paper",
+      "authors": [],
+      "year": null,
+      "doi": null,
+      "journal": null,
+      "keywords": [],
+      "tags": [],
+      "read_status": "read",
+      "topic": null,
+      "file_size": 329,
+      "file_hash": "8c292227f0f9fdbb5f19034f0f00f94b",
+      "added_at": "2026-06-21T02:03:45",
+      "modified_at": "2026-06-21T02:07:57",
+      "notes": null
+    },
+    "D:\\TraeProjects\\1379\\tests\\test_papers\\random_paper_2022.pdf": {
+      "file_path": "D:\\TraeProjects\\1379\\tests\\test_papers\\random_paper_2022.pdf",
+      "title": "random paper 2022",
+      "authors": [],
+      "year": 2022,
+      "doi": null,
+      "journal": null,
+      "keywords": [],
+      "tags": [],
+      "read_status": "unread",
+      "topic": null,
+      "file_size": 329,
+      "file_hash": "8c292227f0f9fdbb5f19034f0f00f94b",
+      "added_at": "2026-06-21T02:03:45",
+      "modified_at": "2026-06-21T02:03:45",
+      "notes": null
+    }
+  }
+}
