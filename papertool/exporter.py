@@ -91,17 +91,36 @@ def export_csv(papers: List[PaperMetadata], output_path: str) -> int:
     return len(papers)
 
 
-def export_reading_list(papers: List[PaperMetadata], output_path: str, group_by: str = "topic") -> int:
+def export_reading_list(papers: List[PaperMetadata], output_path: str,
+                        group_by: List[str] = None) -> int:
+    """
+    导出阅读书单，支持多字段分组。
+
+    Args:
+        papers: 论文列表
+        output_path: 输出文件路径
+        group_by: 分组字段列表，如 ["topic", "year"]，按顺序嵌套分组
+                  支持: topic, read_status, year
+    """
+    if group_by is None:
+        group_by = ["topic"]
+
+    def get_group_key(paper: PaperMetadata, fields: List[str]) -> tuple:
+        key_parts = []
+        for field in fields:
+            if field == "topic":
+                key_parts.append(paper.topic or "未分类")
+            elif field == "read_status":
+                key_parts.append(paper.read_status or "unknown")
+            elif field == "year":
+                key_parts.append(str(paper.year) if paper.year else "未知年份")
+            else:
+                key_parts.append("全部文献")
+        return tuple(key_parts)
+
     grouped = {}
     for paper in papers:
-        if group_by == "topic":
-            key = paper.topic or "未分类"
-        elif group_by == "read_status":
-            key = paper.read_status or "unknown"
-        elif group_by == "year":
-            key = str(paper.year) if paper.year else "未知年份"
-        else:
-            key = "全部文献"
+        key = get_group_key(paper, group_by)
         grouped.setdefault(key, []).append(paper)
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -110,7 +129,14 @@ def export_reading_list(papers: List[PaperMetadata], output_path: str, group_by:
 
         for group_key in sorted(grouped.keys()):
             group_papers = grouped[group_key]
-            f.write(f"## {group_key} ({len(group_papers)}篇)\n\n")
+
+            level = 1
+            for part in group_key:
+                f.write(f"{'#' * (level + 1)} {part}")
+                if level == len(group_key):
+                    f.write(f" ({len(group_papers)}篇)")
+                f.write("\n\n")
+                level += 1
 
             for i, paper in enumerate(group_papers, 1):
                 total += 1
@@ -128,6 +154,8 @@ def export_reading_list(papers: List[PaperMetadata], output_path: str, group_by:
                     f.write(f"   - DOI: {paper.doi}\n")
                 if paper.tags:
                     f.write(f"   - 标签: {', '.join(paper.tags)}\n")
+                if paper.topic:
+                    f.write(f"   - 课题: {paper.topic}\n")
                 f.write(f"   - 状态: {status}\n")
                 f.write(f"   - 文件: `{paper.file_path}`\n\n")
 

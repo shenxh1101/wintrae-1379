@@ -149,24 +149,64 @@ def move_by_topic(
     db: PaperDatabase,
     base_dir: str,
     dry_run: bool = False,
+    layers: List[str] = None,
 ) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """
+    按层级将论文移动到子文件夹。
+
+    Args:
+        db: 论文数据库
+        base_dir: 根目录
+        dry_run: 是否预演
+        layers: 目录层级列表，如 ["topic", "year", "read_status"]
+                支持的值: topic, year, read_status
+                默认 ["topic"]
+    """
+    if layers is None:
+        layers = ["topic"]
+
     moved = []
     errors = []
 
+    valid_layers = {"topic", "year", "read_status"}
+    layers = [l for l in layers if l in valid_layers]
+    if not layers:
+        layers = ["topic"]
+
     for paper in db.all_papers():
-        if not paper.topic:
+        path_parts = []
+        for layer in layers:
+            if layer == "topic":
+                if not paper.topic:
+                    break
+                path_parts.append(paper.topic)
+            elif layer == "year":
+                path_parts.append(str(paper.year) if paper.year else "未知年份")
+            elif layer == "read_status":
+                path_parts.append(paper.read_status or "unknown")
+
+        if not path_parts:
             continue
 
-        topic_dir = os.path.join(base_dir, paper.topic)
+        safe_parts = []
+        for part in path_parts:
+            safe = "".join(c for c in part if c not in '<>:"/\\|?*').strip()
+            if safe:
+                safe_parts.append(safe)
+
+        if not safe_parts:
+            continue
+
+        target_dir = os.path.join(base_dir, *safe_parts)
         old_path = paper.file_path
-        new_path = os.path.join(topic_dir, os.path.basename(old_path))
+        new_path = os.path.join(target_dir, os.path.basename(old_path))
 
         if old_path == new_path:
             continue
 
         if not dry_run:
             try:
-                os.makedirs(topic_dir, exist_ok=True)
+                os.makedirs(target_dir, exist_ok=True)
                 shutil.move(old_path, new_path)
                 db.remove_paper(old_path)
                 paper.file_path = new_path
@@ -264,3 +304,96 @@ def find_papers(
             continue
         results.append(paper)
     return results
+
+
+def import_metadata_from_csv(
+    db: PaperDatabase,
+    csv_path: str,
+    dry_run: bool = False,
+) -> Tuple[List[Tuple[PaperMetadata, dict]], List[str], List[str]]:
+    """
+    从 CSV 批量导入元数据。
+
+    CSV 列名支持：file_path, title, authors, year, doi, journal, keywords, tags, topic, read_status
+    authors / keywords / tags 用分号 "; " 分隔。
+
+    Returns:
+        (updated_papers, not_found_paths, errors)
+        updated_papers: [(paper, new_metadata_dict), ...]
+    """
+    import csv
+
+    updated = []
+    not_found = []
+    errors = []
+
+    field_mapping = {
+        "file_path": "file_path",
+        "title": "title",
+        "authors": "authors",
+        "year": "year",
+        "doi": "doi",
+        "journal": "journal",
+        "keywords": "keywords",
+        "tags": "tags",
+        "topic": "topic",
+        "read_status": "read_status",
+        "status": "read_status",
+    }
+
+    try:
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+
+            for row_num, row in enumerate(reader, 2):
+                if "file_path" not in row or not row["file_path"].strip():
+                    errors.append(f"第 {row_num} 行: 缺少 file_path")
+                    continue
+
+                file_path = _normalize_path(row["file_path"].strip())
+                paper = db.get_paper(file_path)
+
+                if paper is None:
+                    not_found.append(file_path)
+                    continue
+
+                old_meta = paper.to_dict()
+                new_meta = {}
+
+                for csv_col, field in field_mapping.items():
+                    if csv_col == "file_path" or csv_col not in row:
+                        continue
+                    val = row[csv_col].strip()
+                    if not val:
+                        continue
+
+                    if field in ("authors", "keywords", "tags"):
+                        items = [s.strip() for s in val.split(";") if s.strip()]
+                        if items:
+                            new_meta[field] = items
+                    elif field == "year":
+                        try:
+                            new_meta[field] = int(val)
+                        except (ValueError, TypeError):
+                            errors.append(f"第 {row_num} 行: year 必须是整数 ({val!r})")
+                            continue
+                    else:
+                        new_meta[field] = val
+
+                if not new_meta:
+                    continue
+
+                if not dry_run:
+                    for k, v in new_meta.items():
+                        setattr(paper, k, v)
+                    paper.modified_at = now_str()
+                    db.add_paper(paper)
+
+                updated.append((paper, new_meta, old_meta))
+
+    except FileNotFoundError:
+        errors.append(f"文件不存在: {csv_path}")
+    except Exception as e:
+        errors.append(f"读取 CSV 失败: {str(e)}")
+
+    return updated, not_found, errors
